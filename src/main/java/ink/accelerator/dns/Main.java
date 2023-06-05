@@ -13,6 +13,7 @@ import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 public class Main {
@@ -22,6 +23,7 @@ public class Main {
     private static Channel proxyDNS = null;
     private static int queryId = 0;
     private static Map<String, Answer> A = new HashMap<>();
+    private static Map<String, Answer> CNAME = new HashMap<>();
     public static void main(String[] args) throws InterruptedException {
         bootstrap.group(eventLoopGroup)
                 .channel(NioSocketChannel.class)
@@ -39,15 +41,18 @@ public class Main {
                                 DnsResponse dns = (DnsResponse) msg;
 
                                 int count = dns.count(DnsSection.ANSWER);
-                                for (int i = 0; i < count; i++) {
-                                    DnsRecord record = dns.recordAt(DnsSection.ANSWER, i);
-                                    Answer answer = A.get(record.name());
-                                    if (answer == null) {
-                                        answer = new Answer();
-                                        A.put(record.name(), answer);
-                                    }
-                                    answer.records.add(new Record((DefaultDnsRawRecord) ((DefaultDnsRawRecord) record).copy(), LocalDateTime.now().plusSeconds(record.timeToLive())));
-                                }
+                                List<DnsRecord> records = new ArrayList<>();
+                                for (int i = 0; i < count; i++) records.add(dns.recordAt(DnsSection.ANSWER, i));
+                                records.stream()
+                                        .filter(r -> r.type().equals(DnsRecordType.A))
+                                        .map(Record::new)
+                                        .collect(Collectors.groupingBy(Record::name))
+                                        .forEach((k, v) -> update(A, k, v));
+                                records.stream()
+                                        .filter(r -> r.type().equals(DnsRecordType.CNAME))
+                                        .map(Record::new)
+                                        .collect(Collectors.groupingBy(Record::name))
+                                        .forEach((k, v) -> update(CNAME, k, v));
 
                                 Channel channel = ctx.channel().attr(AttributeKey.<Channel>valueOf("channel")).get();
                                 if (channel != null) {
@@ -149,6 +154,25 @@ public class Main {
                 .sync();
     }
 
+    static DnsResponse query(DnsQuery query) {
+        int count = query.count(DnsSection.QUESTION);
+        List<DnsQuery> queries = new ArrayList<>();
+        for (int i = 0; i < count; i++) queries.add(query.recordAt(DnsSection.QUESTION, i));
+        while (queries.size() > 0) {
+            
+        }
+    }
+
+    static void update(Map<String, Answer> map, String key, List<Record> records) {
+        Answer answer = map.get(key);
+        if (answer == null) {
+            answer = new Answer();
+            answer.lastAccess = LocalDateTime.now();
+        }
+        answer.records = records;
+        map.put(key, answer);
+    }
+
     static class Answer {
         List<Record> records = new ArrayList<>();
         DefaultDnsRawRecord questionRecord;
@@ -159,9 +183,13 @@ public class Main {
         DefaultDnsRawRecord record;
         LocalDateTime expire;
 
-        public Record(DefaultDnsRawRecord record, LocalDateTime expire) {
-            this.record = record;
-            this.expire = expire;
+        public Record(DnsRecord record) {
+            this.record = (DefaultDnsRawRecord) ((DefaultDnsRawRecord) record).duplicate();
+            this.expire = LocalDateTime.now().plusSeconds(record.timeToLive());
+        }
+
+        String name() {
+            return record.name();
         }
     }
 }
