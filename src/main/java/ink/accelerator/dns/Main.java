@@ -4,11 +4,13 @@ import io.netty.bootstrap.Bootstrap;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.dns.*;
 import io.netty.util.AttributeKey;
 
+import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
@@ -19,7 +21,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class Main {
-    private static ServerBootstrap serverBootstrap = new ServerBootstrap();
+    private static Bootstrap serverBootstrap = new Bootstrap();
     private static Bootstrap bootstrap = new Bootstrap();
     private static EventLoopGroup eventLoopGroup = new NioEventLoopGroup(1);
     private static Channel proxyDNS = null;
@@ -61,8 +63,11 @@ public class Main {
                                 Channel channel = ctx.channel().attr(AttributeKey.<Channel>valueOf("channel")).get();
                                 if (channel != null) {
                                     Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
-                                    channel.writeAndFlush(getResponse(id, name));
-                                    channel.close();
+                                    channel.writeAndFlush(getResponse(
+                                            ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("recipient")).get(),
+                                            ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("sender")).get(),
+                                            id, name
+                                    ));
                                 }
                             }
 
@@ -72,7 +77,6 @@ public class Main {
                                 if (channel != null) {
                                     Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
                                     channel.writeAndFlush(new DefaultDnsResponse(id));
-                                    channel.close();
                                 }
                                 super.exceptionCaught(ctx, cause);
                             }
@@ -84,23 +88,23 @@ public class Main {
             List<String> keys = A.entrySet().stream().filter(
                     e -> e.getValue().records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire.minusSeconds(10)))
             ).map(Map.Entry::getKey).collect(Collectors.toList());
-            keys.forEach(key -> queryProxy(queryId++, new DefaultDnsQuestion(key, DnsRecordType.A), 0, null));
+            keys.forEach(key -> queryProxy(queryId++, new DefaultDnsQuestion(key, DnsRecordType.A), 0, null, null));
         }, 0, 10, TimeUnit.SECONDS);
 
         serverBootstrap.group(eventLoopGroup)
-                .channel(NioServerSocketChannel.class)
-                .childHandler(new ChannelInitializer<NioSocketChannel>() {
+                .channel(NioDatagramChannel.class)
+                .handler(new ChannelInitializer<NioDatagramChannel>() {
                     @Override
-                    protected void initChannel(NioSocketChannel nioSocketChannel) throws Exception {
-                        nioSocketChannel.pipeline().addLast(new TcpDnsQueryDecoder());
-                        nioSocketChannel.pipeline().addLast(new TcpDnsResponseEncoder());
+                    protected void initChannel(NioDatagramChannel nioSocketChannel) throws Exception {
+                        nioSocketChannel.pipeline().addLast(new DatagramDnsQueryDecoder());
+                        nioSocketChannel.pipeline().addLast(new DatagramDnsResponseEncoder());
                         nioSocketChannel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
                             @Override
                             public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-                                if (!(msg instanceof DnsQuery)) {
+                                if (!(msg instanceof DatagramDnsQuery)) {
                                     return;
                                 }
-                                DnsQuery dnsQuery = (DnsQuery) msg;
+                                DatagramDnsQuery dnsQuery = (DatagramDnsQuery) msg;
                                 DnsRecord record = dnsQuery.recordAt(DnsSection.QUESTION);
                                 if (!DnsRecordType.A.equals(record.type()) || !dnsQuery.isRecursionDesired()) {
                                     ctx.channel().writeAndFlush(new DefaultDnsResponse(dnsQuery.id()));
@@ -112,12 +116,12 @@ public class Main {
                                     if (records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire))) {
                                         A.remove(record.name());
                                     } else {
-                                        ctx.channel().writeAndFlush(getResponse(dnsQuery.id(), record.name()));
+                                        ctx.channel().writeAndFlush(getResponse(dnsQuery.recipient(), dnsQuery.sender(), dnsQuery.id(), record.name()));
                                         return;
                                     }
                                 }
 
-                                queryProxy(dnsQuery.id(), dnsQuery.recordAt(DnsSection.QUESTION), dnsQuery.z(), ctx.channel());
+                                queryProxy(dnsQuery.id(), dnsQuery.recordAt(DnsSection.QUESTION), dnsQuery.z(), ctx.channel(), dnsQuery);
                             }
                         });
                     }
@@ -126,7 +130,7 @@ public class Main {
                 .sync();
     }
 
-    static void queryProxy(int id, DnsQuestion question, int z, Channel channel) {
+    static void queryProxy(int id, DnsQuestion question, int z, Channel channel, DatagramDnsQuery query) {
         DefaultDnsQuery defaultDnsQuery = new DefaultDnsQuery(id);
         defaultDnsQuery.setOpCode(DnsOpCode.QUERY);
         defaultDnsQuery.setRecord(DnsSection.QUESTION, question);
@@ -146,6 +150,10 @@ public class Main {
                 if (channel != null) {
                     proxy.attr(AttributeKey.valueOf("channel")).set(channel);
                 }
+                if (query != null) {
+                    proxy.attr(AttributeKey.valueOf("sender")).set(query.sender());
+                    proxy.attr(AttributeKey.valueOf("recipient")).set(query.recipient());
+                }
                 proxy.attr(AttributeKey.valueOf("question")).set(question);
                 proxy.attr(AttributeKey.valueOf("name")).set(question.name());
                 proxy.attr(AttributeKey.valueOf("id")).set(id);
@@ -154,13 +162,13 @@ public class Main {
         });
     }
 
-    static DnsResponse getResponse(int id, String name) {
+    static DnsResponse getResponse(InetSocketAddress src, InetSocketAddress dst, int id, String name) {
         if (!A.containsKey(name)) {
-            return new DefaultDnsResponse(id);
+            return new DatagramDnsResponse(src, dst, id);
         }
         Answer answer = A.get(name);
         answer.lastAccess = LocalDateTime.now();
-        DefaultDnsResponse response = new DefaultDnsResponse(id);
+        DefaultDnsResponse response = new DatagramDnsResponse(src, dst, id);
         response.setRecord(DnsSection.QUESTION, answer.question);
         answer.records.stream()
                 .map(r -> new DefaultDnsRawRecord(
