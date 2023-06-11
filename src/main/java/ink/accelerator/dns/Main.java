@@ -11,9 +11,11 @@ import io.netty.util.AttributeKey;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.util.*;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Function;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 public class Main {
@@ -23,8 +25,9 @@ public class Main {
     private static Channel proxyDNS = null;
     private static int queryId = 0;
     private static Map<String, Answer> A = new HashMap<>();
-    private static Map<String, Answer> CNAME = new HashMap<>();
+    private static String proxyIp;
     public static void main(String[] args) throws InterruptedException {
+        proxyIp = args[0];
         bootstrap.group(eventLoopGroup)
                 .channel(NioSocketChannel.class)
                 .handler(new ChannelInitializer<NioSocketChannel>() {
@@ -39,63 +42,51 @@ public class Main {
                                     return;
                                 }
                                 DnsResponse dns = (DnsResponse) msg;
+                                String name = ctx.channel().attr(AttributeKey.<String>valueOf("name")).get();
 
                                 int count = dns.count(DnsSection.ANSWER);
-                                List<DnsRecord> records = new ArrayList<>();
-                                for (int i = 0; i < count; i++) records.add(dns.recordAt(DnsSection.ANSWER, i));
-                                records.stream()
-                                        .filter(r -> r.type().equals(DnsRecordType.A))
-                                        .map(Record::new)
-                                        .collect(Collectors.groupingBy(Record::name))
-                                        .forEach((k, v) -> update(A, k, v));
-                                records.stream()
-                                        .filter(r -> r.type().equals(DnsRecordType.CNAME))
-                                        .map(Record::new)
-                                        .collect(Collectors.groupingBy(Record::name))
-                                        .forEach((k, v) -> update(CNAME, k, v));
+
+                                if (count > 0) {
+                                    List<DnsRecord> records = new ArrayList<>();
+                                    for (int i = 0; i < count; i++) records.add(dns.recordAt(DnsSection.ANSWER, i));
+
+                                    List<Record> cacheRecords = records.stream().map(Record::new).collect(Collectors.toList());
+                                    Answer answer = new Answer();
+                                    answer.question = ctx.channel().attr(AttributeKey.<DefaultDnsQuestion>valueOf("question")).get();
+                                    answer.records = cacheRecords;
+                                    answer.lastAccess = LocalDateTime.now();
+                                    A.put(name, answer);
+                                }
 
                                 Channel channel = ctx.channel().attr(AttributeKey.<Channel>valueOf("channel")).get();
                                 if (channel != null) {
-                                    channel.writeAndFlush(dns);
+                                    Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
+                                    channel.writeAndFlush(getResponse(id, name));
                                     channel.close();
                                 }
                             }
 
                             @Override
                             public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                                Channel channel = ctx.channel().attr(AttributeKey.<Channel>valueOf("channel")).get();
+                                if (channel != null) {
+                                    Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
+                                    channel.writeAndFlush(new DefaultDnsResponse(id));
+                                    channel.close();
+                                }
                                 super.exceptionCaught(ctx, cause);
                             }
                         });
                     }
                 });
-        new Thread(() -> {
-            while (true){
-                try {
-                    Thread.sleep(30 * 1000L);
-                } catch (InterruptedException e) {
-                    e.printStackTrace();
-                }
-                A.values().forEach(answer -> answer.records.removeIf(r -> Duration.between(LocalDateTime.now(), r.expire).getSeconds() <= 0));
-                AtomicInteger i = new AtomicInteger(0);
-                DefaultDnsQuery query = new DefaultDnsQuery(1);
-                A.entrySet().stream()
-                        .filter(entry -> entry.getValue().records.stream().anyMatch(r -> Duration.between(LocalDateTime.now(), r.expire).getSeconds() <= 30))
-                        .forEach(entry -> query.addRecord(DnsSection.QUESTION, i.getAndIncrement(), entry.getValue().questionRecord.duplicate()));
-                if (i.intValue() == 0) {
-                    continue;
-                }
-                query.setOpCode(DnsOpCode.QUERY);
-                query.setRecursionDesired(true);
-                bootstrap.connect("8.8.8.8", 53)
-                        .addListener((ChannelFutureListener) future -> {
-                            if (!future.isSuccess()) {
-                                return;
-                            }
-                            future.channel().writeAndFlush(query);
-                        });
 
-            }
-        }).start();
+        eventLoopGroup.scheduleAtFixedRate(() -> {
+            List<String> keys = A.entrySet().stream().filter(
+                    e -> e.getValue().records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire.minusSeconds(10)))
+            ).map(Map.Entry::getKey).collect(Collectors.toList());
+            keys.forEach(key -> queryProxy(queryId++, new DefaultDnsQuestion(key, DnsRecordType.A), 0, null));
+        }, 0, 10, TimeUnit.SECONDS);
+
         serverBootstrap.group(eventLoopGroup)
                 .channel(NioServerSocketChannel.class)
                 .childHandler(new ChannelInitializer<NioSocketChannel>() {
@@ -109,73 +100,82 @@ public class Main {
                                 if (!(msg instanceof DnsQuery)) {
                                     return;
                                 }
-
                                 DnsQuery dnsQuery = (DnsQuery) msg;
                                 DnsRecord record = dnsQuery.recordAt(DnsSection.QUESTION);
-                                if (DnsRecordType.A.equals(record.type()) && dnsQuery.isRecursionDesired() && A.containsKey(record.name())) {
-                                    DefaultDnsResponse response = new DefaultDnsResponse(dnsQuery.id());
-                                    response.setRecord(DnsSection.QUESTION, record);
-                                    A.get(record.name()).records.stream()
-                                            .filter(r -> r.expire.isAfter(LocalDateTime.now()))
-                                            .map(r -> new DefaultDnsRawRecord(
-                                                    r.record.name(),
-                                                    r.record.type(),
-                                                    Duration.between(LocalDateTime.now(), r.expire).getSeconds(),
-                                                    r.record.content().copy())
-                                            )
-                                            .forEach(r -> response.addRecord(DnsSection.ANSWER, r));
-                                    ctx.channel().writeAndFlush(response);
+                                if (!DnsRecordType.A.equals(record.type()) || !dnsQuery.isRecursionDesired()) {
+                                    ctx.channel().writeAndFlush(new DefaultDnsResponse(dnsQuery.id()));
                                     return;
                                 }
 
-                                DefaultDnsQuery defaultDnsQuery = new DefaultDnsQuery(dnsQuery.id());
-                                defaultDnsQuery.setOpCode(dnsQuery.opCode());
-                                defaultDnsQuery.setRecord(DnsSection.QUESTION, dnsQuery.recordAt(DnsSection.QUESTION));
-                                defaultDnsQuery.setRecursionDesired(dnsQuery.isRecursionDesired());
-                                defaultDnsQuery.setZ(dnsQuery.z());
-                                ChannelFuture proxy = bootstrap.connect("8.8.8.8", 53);
-                                proxy.addListener(new ChannelFutureListener() {
-                                    @Override
-                                    public void operationComplete(ChannelFuture channelFuture) throws Exception {
-                                        if (!channelFuture.isSuccess()) {
-                                            channelFuture.channel().close();
-                                            ctx.channel().close();
-                                        }
-                                        Channel proxy = channelFuture.channel();
-                                        proxy.writeAndFlush(defaultDnsQuery);
-                                        proxy.attr(AttributeKey.valueOf("channel")).set(ctx.channel());
+                                if (A.containsKey(record.name())) {
+                                    List<Record> records = A.get(record.name()).records;
+                                    if (records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire))) {
+                                        A.remove(record.name());
+                                    } else {
+                                        ctx.channel().writeAndFlush(getResponse(dnsQuery.id(), record.name()));
+                                        return;
                                     }
-                                });
+                                }
+
+                                queryProxy(dnsQuery.id(), dnsQuery.recordAt(DnsSection.QUESTION), dnsQuery.z(), ctx.channel());
                             }
                         });
                     }
                 })
-                .bind("0.0.0.0", 5353)
+                .bind(args[1], Integer.parseInt(args[2]))
                 .sync();
     }
 
-    static DnsResponse query(DnsQuery query) {
-        int count = query.count(DnsSection.QUESTION);
-        List<DnsQuery> queries = new ArrayList<>();
-        for (int i = 0; i < count; i++) queries.add(query.recordAt(DnsSection.QUESTION, i));
-        while (queries.size() > 0) {
-            
-        }
+    static void queryProxy(int id, DnsQuestion question, int z, Channel channel) {
+        DefaultDnsQuery defaultDnsQuery = new DefaultDnsQuery(id);
+        defaultDnsQuery.setOpCode(DnsOpCode.QUERY);
+        defaultDnsQuery.setRecord(DnsSection.QUESTION, question);
+        defaultDnsQuery.setRecursionDesired(true);
+        defaultDnsQuery.setZ(z);
+        ChannelFuture proxy = bootstrap.connect( proxyIp, 53);
+        proxy.addListener(new ChannelFutureListener() {
+            @Override
+            public void operationComplete(ChannelFuture channelFuture) throws Exception {
+                if (!channelFuture.isSuccess()) {
+                    channelFuture.channel().close();
+                    if (channel != null) {
+                        channel.close();
+                    }
+                }
+                Channel proxy = channelFuture.channel();
+                if (channel != null) {
+                    proxy.attr(AttributeKey.valueOf("channel")).set(channel);
+                }
+                proxy.attr(AttributeKey.valueOf("question")).set(question);
+                proxy.attr(AttributeKey.valueOf("name")).set(question.name());
+                proxy.attr(AttributeKey.valueOf("id")).set(id);
+                proxy.writeAndFlush(defaultDnsQuery);
+            }
+        });
     }
 
-    static void update(Map<String, Answer> map, String key, List<Record> records) {
-        Answer answer = map.get(key);
-        if (answer == null) {
-            answer = new Answer();
-            answer.lastAccess = LocalDateTime.now();
+    static DnsResponse getResponse(int id, String name) {
+        if (!A.containsKey(name)) {
+            return new DefaultDnsResponse(id);
         }
-        answer.records = records;
-        map.put(key, answer);
+        Answer answer = A.get(name);
+        answer.lastAccess = LocalDateTime.now();
+        DefaultDnsResponse response = new DefaultDnsResponse(id);
+        response.setRecord(DnsSection.QUESTION, answer.question);
+        answer.records.stream()
+                .map(r -> new DefaultDnsRawRecord(
+                        r.record.name(),
+                        r.record.type(),
+                        Duration.between(LocalDateTime.now(), r.expire).getSeconds(),
+                        r.record.content().copy())
+                )
+                .forEach(r -> response.addRecord(DnsSection.ANSWER, r));
+        return response;
     }
 
     static class Answer {
         List<Record> records = new ArrayList<>();
-        DefaultDnsRawRecord questionRecord;
+        DefaultDnsQuestion question;
         LocalDateTime lastAccess;
     }
 
