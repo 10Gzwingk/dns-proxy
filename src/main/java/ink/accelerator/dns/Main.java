@@ -63,6 +63,10 @@ public class Main {
                                     answer.question = ctx.channel().attr(AttributeKey.<DefaultDnsQuestion>valueOf("question")).get();
                                     answer.records = cacheRecords;
                                     answer.lastAccess = LocalDateTime.now();
+                                    Answer answer1 = A.get(name);
+                                    if (answer1 != null) {
+                                        answer1.records.forEach(r -> r.record.content().release());
+                                    }
                                     A.put(name, answer);
                                 }
 
