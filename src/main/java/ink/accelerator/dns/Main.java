@@ -8,6 +8,8 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.dns.*;
+import io.netty.handler.codec.string.StringDecoder;
+import io.netty.handler.codec.string.StringEncoder;
 import io.netty.util.AttributeKey;
 
 import java.net.InetSocketAddress;
@@ -23,6 +25,7 @@ import java.util.stream.Collectors;
 public class Main {
     private static Bootstrap serverBootstrap = new Bootstrap();
     private static Bootstrap bootstrap = new Bootstrap();
+    private static ServerBootstrap managerBootStrap = new ServerBootstrap();
     private static EventLoopGroup eventLoopGroup = new NioEventLoopGroup(1);
     private static Channel proxyDNS = null;
     private static int queryId = 0;
@@ -91,6 +94,23 @@ public class Main {
             keys.forEach(key -> queryProxy(queryId++, new DefaultDnsQuestion(key, DnsRecordType.A), 0, null, null));
         }, 0, 10, TimeUnit.SECONDS);
 
+        managerBootStrap.group(eventLoopGroup)
+                .channel(NioServerSocketChannel.class)
+                .childHandler(new ChannelInitializer<NioSocketChannel>() {
+                    @Override
+                    protected void initChannel(NioSocketChannel ch) throws Exception {
+                        ch.pipeline().addLast(new StringEncoder());
+                        ch.pipeline().addLast(new StringDecoder());
+                        ch.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                            @Override
+                            public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+                                ctx.writeAndFlush(executeCommand((String) msg) + "\n");
+                            }
+                        });
+                    }
+                })
+                .bind("0.0.0.0", 5355);
+
         serverBootstrap.group(eventLoopGroup)
                 .channel(NioDatagramChannel.class)
                 .handler(new ChannelInitializer<NioDatagramChannel>() {
@@ -128,6 +148,22 @@ public class Main {
                 })
                 .bind(args[1], Integer.parseInt(args[2]))
                 .sync();
+    }
+
+    static String executeCommand(String command) {
+        switch (command) {
+            case "count\n":
+                return String.valueOf(A.size());
+            case "list\n":
+                StringBuilder sb = new StringBuilder();
+                A.keySet().forEach(key -> sb.append(key).append("\n"));
+                return sb.toString();
+            default:
+                if (command.startsWith("remove")) {
+                    A.remove(command.substring(7));
+                }
+                return "ok";
+        }
     }
 
     static void queryProxy(int id, DnsQuestion question, int z, Channel channel, DatagramDnsQuery query) {
