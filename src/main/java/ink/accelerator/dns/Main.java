@@ -32,6 +32,9 @@ public class Main {
     private static Map<String, Answer> A = new HashMap<>();
     private static String proxyIp;
     public static void main(String[] args) throws InterruptedException {
+        DatagramDnsQueryDecoder datagramDnsQueryDecoder = new DatagramDnsQueryDecoder();
+        DatagramDnsResponseEncoder datagramDnsResponseEncoder = new DatagramDnsResponseEncoder();
+
         proxyIp = args[0];
         bootstrap.group(eventLoopGroup)
                 .channel(NioSocketChannel.class)
@@ -91,7 +94,7 @@ public class Main {
             List<String> keys = A.entrySet().stream().filter(
                     e -> e.getValue().records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire.minusSeconds(10)))
             ).map(Map.Entry::getKey).collect(Collectors.toList());
-            keys.forEach(key -> queryProxy(queryId++, new DefaultDnsQuestion(key, DnsRecordType.A), 0, null, null));
+            keys.forEach(key -> queryProxy(queryId++, new DefaultDnsQuestion(key, DnsRecordType.A), null, null));
         }, 0, 10, TimeUnit.SECONDS);
 
         managerBootStrap.group(eventLoopGroup)
@@ -116,8 +119,8 @@ public class Main {
                 .handler(new ChannelInitializer<NioDatagramChannel>() {
                     @Override
                     protected void initChannel(NioDatagramChannel nioSocketChannel) throws Exception {
-                        nioSocketChannel.pipeline().addLast(new DatagramDnsQueryDecoder());
-                        nioSocketChannel.pipeline().addLast(new DatagramDnsResponseEncoder());
+                        nioSocketChannel.pipeline().addLast(datagramDnsQueryDecoder);
+                        nioSocketChannel.pipeline().addLast(datagramDnsResponseEncoder);
                         nioSocketChannel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
                             @Override
                             public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
@@ -141,7 +144,7 @@ public class Main {
                                     }
                                 }
 
-                                queryProxy(dnsQuery.id(), dnsQuery.recordAt(DnsSection.QUESTION), dnsQuery.z(), ctx.channel(), dnsQuery);
+                                queryProxy(dnsQuery.id(), dnsQuery.recordAt(DnsSection.QUESTION), ctx.channel(), dnsQuery);
                             }
                         });
                     }
@@ -166,12 +169,11 @@ public class Main {
         }
     }
 
-    static void queryProxy(int id, DnsQuestion question, int z, Channel channel, DatagramDnsQuery query) {
+    static void queryProxy(int id, DnsQuestion question, Channel channel, DatagramDnsQuery query) {
         DefaultDnsQuery defaultDnsQuery = new DefaultDnsQuery(id);
         defaultDnsQuery.setOpCode(DnsOpCode.QUERY);
         defaultDnsQuery.setRecord(DnsSection.QUESTION, question);
         defaultDnsQuery.setRecursionDesired(true);
-        defaultDnsQuery.setZ(z);
         ChannelFuture proxy = bootstrap.connect( proxyIp, 53);
         proxy.addListener(new ChannelFutureListener() {
             @Override
