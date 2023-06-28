@@ -95,10 +95,20 @@ public class Main {
                 });
 
         eventLoopGroup.scheduleAtFixedRate(() -> {
-            List<String> keys = A.entrySet().stream().filter(
-                    e -> e.getValue().records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire.minusSeconds(10)))
-            ).map(Map.Entry::getKey).collect(Collectors.toList());
-            keys.forEach(key -> queryProxy(queryId++, new DefaultDnsQuestion(key, DnsRecordType.A), null, null));
+            try {
+                A.keySet().forEach(key -> {
+                    if (A.get(key).lastAccess.isBefore(LocalDateTime.now().minusHours(1))) {
+                        A.remove(key);
+                    }
+                });
+                List<String> keys = A.entrySet()
+                        .stream()
+                        .filter(e -> e.getValue().records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire.minusSeconds(10))))
+                        .map(Map.Entry::getKey).collect(Collectors.toList());
+                keys.forEach(key -> queryProxy(queryId++, new DefaultDnsQuestion(key, DnsRecordType.A), null, null));
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
         }, 0, 10, TimeUnit.SECONDS);
 
         managerBootStrap.group(eventLoopGroup)
@@ -128,27 +138,32 @@ public class Main {
                         nioSocketChannel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
                             @Override
                             public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-                                if (!(msg instanceof DatagramDnsQuery)) {
-                                    return;
-                                }
-                                DatagramDnsQuery dnsQuery = (DatagramDnsQuery) msg;
-                                DnsRecord record = dnsQuery.recordAt(DnsSection.QUESTION);
-                                if (!DnsRecordType.A.equals(record.type()) || !dnsQuery.isRecursionDesired()) {
-                                    ctx.channel().writeAndFlush(new DefaultDnsResponse(dnsQuery.id()));
-                                    return;
-                                }
-
-                                if (A.containsKey(record.name())) {
-                                    List<Record> records = A.get(record.name()).records;
-                                    if (records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire))) {
-                                        A.remove(record.name());
-                                    } else {
-                                        ctx.channel().writeAndFlush(getResponse(dnsQuery.recipient(), dnsQuery.sender(), dnsQuery.id(), record.name()));
+                                try {
+                                    if (!(msg instanceof DatagramDnsQuery)) {
                                         return;
                                     }
-                                }
+                                    DatagramDnsQuery dnsQuery = (DatagramDnsQuery) msg;
+                                    DnsRecord record = dnsQuery.recordAt(DnsSection.QUESTION);
+                                    if (!DnsRecordType.A.equals(record.type()) || !dnsQuery.isRecursionDesired()) {
+                                        ctx.channel().writeAndFlush(new DefaultDnsResponse(dnsQuery.id()));
+                                        return;
+                                    }
 
-                                queryProxy(dnsQuery.id(), dnsQuery.recordAt(DnsSection.QUESTION), ctx.channel(), dnsQuery);
+                                    if (A.containsKey(record.name())) {
+                                        List<Record> records = A.get(record.name()).records;
+                                        if (records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire))) {
+                                            A.remove(record.name());
+                                        } else {
+                                            ctx.channel().writeAndFlush(getResponse(dnsQuery.recipient(), dnsQuery.sender(), dnsQuery.id(), record.name()));
+                                            return;
+                                        }
+                                    }
+
+                                    queryProxy(dnsQuery.id(), dnsQuery.recordAt(DnsSection.QUESTION), ctx.channel(), dnsQuery);
+                                } catch (Exception e) {
+                                    System.out.println("udp channel exception");
+                                    e.printStackTrace();
+                                }
                             }
                         });
                     }
