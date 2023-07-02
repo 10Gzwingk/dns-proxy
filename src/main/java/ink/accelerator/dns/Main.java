@@ -88,7 +88,8 @@ public class Main {
                                     Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
                                     channel.writeAndFlush(new DefaultDnsResponse(id));
                                 }
-                                super.exceptionCaught(ctx, cause);
+                                cause.printStackTrace();
+                                channel.close();
                             }
                         });
                     }
@@ -167,9 +168,16 @@ public class Main {
                             }
                         });
                     }
+
+                    @Override
+                    public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+                        ctx.channel().close();
+                        cause.printStackTrace();
+                    }
                 })
                 .bind(args[1], Integer.parseInt(args[2]))
                 .sync();
+        Thread.sleep(3600 * 24 * 365 * 1000L);
     }
 
     static String executeCommand(String command) {
