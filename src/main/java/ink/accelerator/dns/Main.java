@@ -10,15 +10,13 @@ import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.dns.*;
 import io.netty.handler.codec.string.StringDecoder;
 import io.netty.handler.codec.string.StringEncoder;
+import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
 
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -83,29 +81,42 @@ public class Main {
 
                             @Override
                             public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-                                Channel channel = ctx.channel().attr(AttributeKey.<Channel>valueOf("channel")).get();
-                                if (channel != null) {
-                                    Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
-                                    channel.writeAndFlush(new DefaultDnsResponse(id));
+                                try {
+                                    cause.printStackTrace();
+                                    Channel channel = ctx.channel();
+                                    if (channel == null) return;
+                                    Attribute<Channel> attr = channel.attr(AttributeKey.<Channel>valueOf("channel"));
+                                    if (attr == null) return;
+                                    Channel pairChannel = attr.get();
+                                    if (pairChannel == null) return;
+                                    Attribute<Integer> idAttr = channel.attr(AttributeKey.<Integer>valueOf("id"));
+                                    if (idAttr != null) {
+                                        pairChannel.writeAndFlush(new DefaultDnsResponse(idAttr.get()));
+                                    }
+                                    channel.close();
+                                } catch (Exception e) {
+                                    e.printStackTrace();
                                 }
-                                cause.printStackTrace();
-                                channel.close();
                             }
                         });
                     }
                 });
 
         eventLoopGroup.scheduleAtFixedRate(() -> {
+            Set<String> expiredKeys = A.entrySet().stream()
+                    .filter(entry -> entry.getValue().lastAccess.isBefore(LocalDateTime.now().minusHours(1)))
+                    .map(Map.Entry::getKey)
+                    .collect(Collectors.toSet());
+            System.out.println("expiredKeys size=" + expiredKeys.size());
+            (new HashSet<>(expiredKeys)).forEach(key -> A.remove(key));
+
+
             try {
-                A.keySet().forEach(key -> {
-                    if (A.get(key).lastAccess.isBefore(LocalDateTime.now().minusHours(1))) {
-                        A.remove(key);
-                    }
-                });
-                List<String> keys = A.entrySet()
-                        .stream()
+                List<String> keys = A.entrySet().stream()
                         .filter(e -> e.getValue().records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire.minusSeconds(10))))
-                        .map(Map.Entry::getKey).collect(Collectors.toList());
+                        .map(Map.Entry::getKey)
+                        .collect(Collectors.toList());
+                System.out.println("refresh keys size=" + keys.size());
                 keys.forEach(key -> queryProxy(queryId++, new DefaultDnsQuestion(key, DnsRecordType.A), null, null));
             } catch (Exception e) {
                 e.printStackTrace();
@@ -162,7 +173,7 @@ public class Main {
 
                                     queryProxy(dnsQuery.id(), dnsQuery.recordAt(DnsSection.QUESTION), ctx.channel(), dnsQuery);
                                 } catch (Exception e) {
-                                    System.out.println("udp channel exception");
+                                    System.out.println("channelRead: udp channel exception");
                                     e.printStackTrace();
                                 }
                             }
@@ -171,7 +182,7 @@ public class Main {
 
                     @Override
                     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-                        ctx.channel().close();
+                        System.out.println("exceptionCaught: udp channel exception");
                         cause.printStackTrace();
                     }
                 })
@@ -207,9 +218,6 @@ public class Main {
             public void operationComplete(ChannelFuture channelFuture) throws Exception {
                 if (!channelFuture.isSuccess()) {
                     channelFuture.channel().close();
-                    if (channel != null) {
-                        channel.close();
-                    }
                 }
                 Channel proxy = channelFuture.channel();
                 if (channel != null) {
