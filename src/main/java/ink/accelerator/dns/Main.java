@@ -29,6 +29,9 @@ public class Main {
     private static int queryId = 0;
     private static Map<String, Answer> A = new HashMap<>();
     private static String proxyIp;
+
+    private static boolean enableCache = false;
+
     public static void main(String[] args) throws InterruptedException {
         DatagramDnsQueryDecoder datagramDnsQueryDecoder = new DatagramDnsQueryDecoder();
         DatagramDnsResponseEncoder datagramDnsResponseEncoder = new DatagramDnsResponseEncoder();
@@ -52,31 +55,33 @@ public class Main {
 
                                 int count = dns.count(DnsSection.ANSWER);
 
-                                if (count > 0) {
-                                    List<DnsRecord> records = new ArrayList<>();
-                                    for (int i = 0; i < count; i++) records.add(dns.recordAt(DnsSection.ANSWER, i));
-
-                                    List<Record> cacheRecords = records.stream().map(Record::new).collect(Collectors.toList());
-                                    Answer answer = new Answer();
-                                    answer.question = ctx.channel().attr(AttributeKey.<DefaultDnsQuestion>valueOf("question")).get();
-                                    answer.records = cacheRecords;
-                                    answer.lastAccess = LocalDateTime.now();
-                                    Answer answer1 = A.get(name);
-                                    if (answer1 != null) {
-                                        answer1.records.forEach(r -> r.record.content().release());
-                                    }
-                                    A.put(name, answer);
+                                if (count <= 0) {
+                                    return;
                                 }
+                                List<DnsRecord> records = new ArrayList<>();
+                                for (int i = 0; i < count; i++) records.add(dns.recordAt(DnsSection.ANSWER, i));
 
+                                List<Record> cacheRecords = records.stream().map(Record::new).collect(Collectors.toList());
                                 Channel channel = ctx.channel().attr(AttributeKey.<Channel>valueOf("channel")).get();
-                                if (channel != null) {
-                                    Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
-                                    channel.writeAndFlush(getResponse(
-                                            ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("recipient")).get(),
-                                            ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("sender")).get(),
-                                            id, name
-                                    ));
+                                if (channel == null) {
+                                    return;
                                 }
+                                Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
+                                DnsResponse response = getResponse(
+                                        ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("recipient")).get(),
+                                        ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("sender")).get(),
+                                        id, name
+                                );
+                                response.setRecord(DnsSection.QUESTION, ctx.channel().attr(AttributeKey.<DefaultDnsQuestion>valueOf("question")).get());
+                                cacheRecords.stream()
+                                        .map(r -> new DefaultDnsRawRecord(
+                                                r.record.name(),
+                                                r.record.type(),
+                                                Duration.between(LocalDateTime.now(), r.expire).getSeconds(),
+                                                r.record.content().copy())
+                                        )
+                                        .forEach(r -> response.addRecord(DnsSection.ANSWER, r));
+                                channel.writeAndFlush(response);
                             }
 
                             @Override
@@ -151,24 +156,15 @@ public class Main {
                             @Override
                             public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
                                 try {
-                                    if (!(msg instanceof DatagramDnsQuery)) {
+                                    if (!(msg instanceof DatagramDnsQuery dnsQuery)) {
                                         return;
                                     }
-                                    DatagramDnsQuery dnsQuery = (DatagramDnsQuery) msg;
+
+                                    // 获取请求参数
                                     DnsRecord record = dnsQuery.recordAt(DnsSection.QUESTION);
                                     if (!DnsRecordType.A.equals(record.type()) || !dnsQuery.isRecursionDesired()) {
                                         ctx.channel().writeAndFlush(new DefaultDnsResponse(dnsQuery.id()));
                                         return;
-                                    }
-
-                                    if (A.containsKey(record.name())) {
-                                        List<Record> records = A.get(record.name()).records;
-                                        if (records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire))) {
-                                            A.remove(record.name());
-                                        } else {
-                                            ctx.channel().writeAndFlush(getResponse(dnsQuery.recipient(), dnsQuery.sender(), dnsQuery.id(), record.name()));
-                                            return;
-                                        }
                                     }
 
                                     queryProxy(dnsQuery.id(), dnsQuery.recordAt(DnsSection.QUESTION), ctx.channel(), dnsQuery);
@@ -179,6 +175,8 @@ public class Main {
                             }
                         });
                     }
+
+
 
                     @Override
                     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
@@ -200,6 +198,10 @@ public class Main {
                 A.keySet().forEach(key -> sb.append(key).append("\n"));
                 return sb.toString();
             default:
+                if (command.startsWith("proxy")) {
+                    proxyIp = command.split(" ")[1];
+                    return proxyIp;
+                }
                 if (command.startsWith("remove")) {
                     A.remove(command.substring(7));
                 }
@@ -254,6 +256,21 @@ public class Main {
         return response;
     }
 
+    static DnsResponse getResponse(InetSocketAddress src, InetSocketAddress dst, int id, Answer answer) {
+        answer.lastAccess = LocalDateTime.now();
+        DefaultDnsResponse response = new DatagramDnsResponse(src, dst, id);
+        response.setRecord(DnsSection.QUESTION, answer.question);
+        answer.records.stream()
+                .map(r -> new DefaultDnsRawRecord(
+                        r.record.name(),
+                        r.record.type(),
+                        Duration.between(LocalDateTime.now(), r.expire).getSeconds(),
+                        r.record.content().copy())
+                )
+                .forEach(r -> response.addRecord(DnsSection.ANSWER, r));
+        return response;
+    }
+
     static class Answer {
         List<Record> records = new ArrayList<>();
         DefaultDnsQuestion question;
@@ -272,5 +289,22 @@ public class Main {
         String name() {
             return record.name();
         }
+    }
+
+    static void put(String key, Answer answer) {
+        if (enableCache) {
+            A.put(key, answer);
+        }
+    }
+
+    static Answer get(String key) {
+        if (!enableCache) return null;
+        Answer answer = A.get(key);
+        List<Record> records = answer.records;
+        if (records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire))) {
+            A.remove(key);
+            return null;
+        }
+        return answer;
     }
 }
