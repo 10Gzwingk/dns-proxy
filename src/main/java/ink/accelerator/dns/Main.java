@@ -30,6 +30,13 @@ public class Main {
     private static Map<String, Answer> A = new HashMap<>();
     private static String proxyIp;
 
+    private static String nonProxyIp = "211.140.188.188";
+
+    private static Set<String> proxyDomains = new HashSet<>();
+    static {
+        proxyDomains.add(".");
+    }
+
     private static boolean enableCache = false;
 
     public static void main(String[] args) throws InterruptedException {
@@ -190,12 +197,15 @@ public class Main {
     }
 
     static String executeCommand(String command) {
+        StringBuilder sb = new StringBuilder();
         switch (command) {
             case "count\n":
                 return String.valueOf(A.size());
             case "list\n":
-                StringBuilder sb = new StringBuilder();
                 A.keySet().forEach(key -> sb.append(key).append("\n"));
+                return sb.toString();
+            case "listproxy\n":
+                proxyDomains.forEach(key -> sb.append(key).append("\n"));
                 return sb.toString();
             default:
                 if (command.startsWith("proxy")) {
@@ -205,16 +215,26 @@ public class Main {
                 if (command.startsWith("remove")) {
                     A.remove(command.substring(7));
                 }
+                if (command.startsWith("addproxy")) {
+                    String domain = command.split(" ")[1];
+                    proxyDomains.add(domain.substring(0, domain.length() - 1));
+                }
+                if (command.startsWith("delproxy")) {
+                    String domain = command.split(" ")[1];
+                    proxyDomains.remove(domain);
+                }
                 return "ok";
         }
     }
 
     static void queryProxy(int id, DnsQuestion question, Channel channel, DatagramDnsQuery query) {
+        boolean doProxy = proxyDomains.stream()
+                .anyMatch(domain -> question.name().contains(domain));
         DefaultDnsQuery defaultDnsQuery = new DefaultDnsQuery(id);
         defaultDnsQuery.setOpCode(DnsOpCode.QUERY);
         defaultDnsQuery.setRecord(DnsSection.QUESTION, question);
         defaultDnsQuery.setRecursionDesired(true);
-        ChannelFuture proxy = bootstrap.connect( proxyIp, 53);
+        ChannelFuture proxy = bootstrap.connect( doProxy ? proxyIp : nonProxyIp, 53);
         proxy.addListener(new ChannelFutureListener() {
             @Override
             public void operationComplete(ChannelFuture channelFuture) throws Exception {
