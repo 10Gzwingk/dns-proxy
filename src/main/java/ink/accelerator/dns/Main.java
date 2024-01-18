@@ -23,6 +23,7 @@ import java.util.stream.Collectors;
 public class Main {
     private static Bootstrap serverBootstrap = new Bootstrap();
     private static Bootstrap bootstrap = new Bootstrap();
+    private static Bootstrap nonProxyBootstrap = new Bootstrap();
     private static ServerBootstrap managerBootStrap = new ServerBootstrap();
     private static EventLoopGroup eventLoopGroup = new NioEventLoopGroup(1);
     private static Channel proxyDNS = null;
@@ -33,9 +34,9 @@ public class Main {
     private static String nonProxyIp = "211.140.188.188";
 
     private static Set<String> proxyDomains = new HashSet<>();
-    static {
-        proxyDomains.add(".");
-    }
+//    static {
+//        proxyDomains.add("bili");
+//    }
 
     private static boolean enableCache = false;
 
@@ -51,68 +52,21 @@ public class Main {
                     protected void initChannel(NioSocketChannel nioSocketChannel) throws Exception {
                         nioSocketChannel.pipeline().addLast(new TcpDnsQueryEncoder());
                         nioSocketChannel.pipeline().addLast(new TcpDnsResponseDecoder());
-                        nioSocketChannel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
-                            @Override
-                            public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-                                if (!(msg instanceof DnsResponse)) {
-                                    return;
-                                }
-                                DnsResponse dns = (DnsResponse) msg;
-                                String name = ctx.channel().attr(AttributeKey.<String>valueOf("name")).get();
-
-                                int count = dns.count(DnsSection.ANSWER);
-
-                                if (count <= 0) {
-                                    return;
-                                }
-                                List<DnsRecord> records = new ArrayList<>();
-                                for (int i = 0; i < count; i++) records.add(dns.recordAt(DnsSection.ANSWER, i));
-
-                                List<Record> cacheRecords = records.stream().map(Record::new).collect(Collectors.toList());
-                                Channel channel = ctx.channel().attr(AttributeKey.<Channel>valueOf("channel")).get();
-                                if (channel == null) {
-                                    return;
-                                }
-                                Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
-                                DnsResponse response = getResponse(
-                                        ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("recipient")).get(),
-                                        ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("sender")).get(),
-                                        id, name
-                                );
-                                response.setRecord(DnsSection.QUESTION, ctx.channel().attr(AttributeKey.<DefaultDnsQuestion>valueOf("question")).get());
-                                cacheRecords.stream()
-                                        .map(r -> new DefaultDnsRawRecord(
-                                                r.record.name(),
-                                                r.record.type(),
-                                                Duration.between(LocalDateTime.now(), r.expire).getSeconds(),
-                                                r.record.content().copy())
-                                        )
-                                        .forEach(r -> response.addRecord(DnsSection.ANSWER, r));
-                                channel.writeAndFlush(response);
-                            }
-
-                            @Override
-                            public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
-                                try {
-                                    cause.printStackTrace();
-                                    Channel channel = ctx.channel();
-                                    if (channel == null) return;
-                                    Attribute<Channel> attr = channel.attr(AttributeKey.<Channel>valueOf("channel"));
-                                    if (attr == null) return;
-                                    Channel pairChannel = attr.get();
-                                    if (pairChannel == null) return;
-                                    Attribute<Integer> idAttr = channel.attr(AttributeKey.<Integer>valueOf("id"));
-                                    if (idAttr != null) {
-                                        pairChannel.writeAndFlush(new DefaultDnsResponse(idAttr.get()));
-                                    }
-                                    channel.close();
-                                } catch (Exception e) {
-                                    e.printStackTrace();
-                                }
-                            }
-                        });
+                        nioSocketChannel.pipeline().addLast(dnsClientHandler);
                     }
                 });
+        // 透传客户端，走udp
+        nonProxyBootstrap.group(eventLoopGroup)
+                .channel(NioDatagramChannel.class)
+                .handler(new ChannelInitializer<NioDatagramChannel>() {
+                    @Override
+                    protected void initChannel(NioDatagramChannel channel) throws Exception {
+                        channel.pipeline().addLast(new DatagramDnsQueryEncoder());
+                        channel.pipeline().addLast(new DatagramDnsResponseDecoder());
+                        channel.pipeline().addLast(dnsClientHandler);
+                    }
+                });
+
 
         eventLoopGroup.scheduleAtFixedRate(() -> {
             Set<String> expiredKeys = A.entrySet().stream()
@@ -196,6 +150,70 @@ public class Main {
         Thread.sleep(3600 * 24 * 365 * 1000L);
     }
 
+    static final ChannelHandler dnsClientHandler = new DnsClientHandler();
+
+    @ChannelHandler.Sharable
+    static class DnsClientHandler extends ChannelInboundHandlerAdapter {
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+            if (!(msg instanceof DnsResponse)) {
+                return;
+            }
+            DnsResponse dns = (DnsResponse) msg;
+            String name = ctx.channel().attr(AttributeKey.<String>valueOf("name")).get();
+
+            int count = dns.count(DnsSection.ANSWER);
+
+            if (count <= 0) {
+                return;
+            }
+            List<DnsRecord> records = new ArrayList<>();
+            for (int i = 0; i < count; i++) records.add(dns.recordAt(DnsSection.ANSWER, i));
+
+            List<Record> cacheRecords = records.stream().map(Record::new).collect(Collectors.toList());
+            Channel channel = ctx.channel().attr(AttributeKey.<Channel>valueOf("channel")).get();
+            if (channel == null) {
+                return;
+            }
+            Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
+            DnsResponse response = getResponse(
+                    ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("recipient")).get(),
+                    ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("sender")).get(),
+                    id, name
+            );
+            response.setRecord(DnsSection.QUESTION, ctx.channel().attr(AttributeKey.<DefaultDnsQuestion>valueOf("question")).get());
+            cacheRecords.stream()
+                    .map(r -> new DefaultDnsRawRecord(
+                            r.record.name(),
+                            r.record.type(),
+                            Duration.between(LocalDateTime.now(), r.expire).getSeconds(),
+                            r.record.content().copy())
+                    )
+                    .forEach(r -> response.addRecord(DnsSection.ANSWER, r));
+            channel.writeAndFlush(response);
+        }
+
+        @Override
+        public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
+            try {
+                cause.printStackTrace();
+                Channel channel = ctx.channel();
+                if (channel == null) return;
+                Attribute<Channel> attr = channel.attr(AttributeKey.<Channel>valueOf("channel"));
+                if (attr == null) return;
+                Channel pairChannel = attr.get();
+                if (pairChannel == null) return;
+                Attribute<Integer> idAttr = channel.attr(AttributeKey.<Integer>valueOf("id"));
+                if (idAttr != null) {
+                    pairChannel.writeAndFlush(new DefaultDnsResponse(idAttr.get()));
+                }
+                channel.close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
+        }
+    }
+
     static String executeCommand(String command) {
         StringBuilder sb = new StringBuilder();
         switch (command) {
@@ -230,17 +248,27 @@ public class Main {
     static void queryProxy(int id, DnsQuestion question, Channel channel, DatagramDnsQuery query) {
         boolean doProxy = proxyDomains.stream()
                 .anyMatch(domain -> question.name().contains(domain));
-        DefaultDnsQuery defaultDnsQuery = new DefaultDnsQuery(id);
-        defaultDnsQuery.setOpCode(DnsOpCode.QUERY);
-        defaultDnsQuery.setRecord(DnsSection.QUESTION, question);
-        defaultDnsQuery.setRecursionDesired(true);
-        ChannelFuture proxy = bootstrap.connect( doProxy ? proxyIp : nonProxyIp, 53);
+        ChannelFuture proxy;
+        if (doProxy) {
+            proxy = bootstrap.connect(proxyIp, 53);
+        } else {
+            proxy = nonProxyBootstrap.connect(nonProxyIp, 53);
+        }
         proxy.addListener(new ChannelFutureListener() {
             @Override
             public void operationComplete(ChannelFuture channelFuture) throws Exception {
                 if (!channelFuture.isSuccess()) {
                     channelFuture.channel().close();
                 }
+                DefaultDnsQuery defaultDnsQuery;
+                if (doProxy) {
+                    defaultDnsQuery = new DefaultDnsQuery(id);
+                } else {
+                    defaultDnsQuery = new DatagramDnsQuery((InetSocketAddress) channelFuture.channel().localAddress(), (InetSocketAddress) channelFuture.channel().remoteAddress(), query.id());
+                }
+                defaultDnsQuery.setOpCode(DnsOpCode.QUERY);
+                defaultDnsQuery.setRecord(DnsSection.QUESTION, question);
+                defaultDnsQuery.setRecursionDesired(true);
                 Channel proxy = channelFuture.channel();
                 if (channel != null) {
                     proxy.attr(AttributeKey.valueOf("channel")).set(channel);
