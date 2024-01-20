@@ -1,46 +1,46 @@
 package ink.accelerator.dns;
 
 import io.netty.bootstrap.Bootstrap;
-import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.*;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioDatagramChannel;
-import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.dns.*;
-import io.netty.handler.codec.string.StringDecoder;
-import io.netty.handler.codec.string.StringEncoder;
 import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
 import java.net.InetSocketAddress;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.*;
-import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
 
 public class Main {
-    private static Bootstrap serverBootstrap = new Bootstrap();
-    private static Bootstrap bootstrap = new Bootstrap();
-    private static Bootstrap nonProxyBootstrap = new Bootstrap();
-    private static ServerBootstrap managerBootStrap = new ServerBootstrap();
-    private static EventLoopGroup eventLoopGroup = new NioEventLoopGroup(1);
-    private static Channel proxyDNS = null;
-    private static int queryId = 0;
-    private static Map<String, Answer> A = new HashMap<>();
-    private static String proxyIp;
-
+    private static final Bootstrap serverBootstrap = new Bootstrap();
+    private static final Bootstrap bootstrap = new Bootstrap();
+    private static final Bootstrap nonProxyBootstrap = new Bootstrap();
+    private static final EventLoopGroup eventLoopGroup = new NioEventLoopGroup(1);
+    private static String proxyIp = "8.8.8.8";
     private static String nonProxyIp = "211.140.188.188";
+    private static final Set<String> proxyDomains = new HashSet<>();
+    static {
+        proxyDomains.add("google");
+    }
+    private static final Map<Integer, InetSocketAddress> socketMap = new HashMap<>();
+    private static final Map<Integer, Integer> idMap = new HashMap<>();
+    private static InetSocketAddress serverSocketAddress = null;
+    private static Channel serverChannel = null;
+    private static Channel clientNonProxyChannel;
+    private static InetSocketAddress clientLocalSocketAddress;
+    private static InetSocketAddress clientRemoteSocketAddress;
+    private static int globalId = 0;
 
-    private static Set<String> proxyDomains = new HashSet<>();
-//    static {
-//        proxyDomains.add("bili");
-//    }
-
-    private static boolean enableCache = false;
-
-    public static void main(String[] args) throws InterruptedException {
+    public static void main(String[] args) throws InterruptedException, IOException {
+        serverSocketAddress = new InetSocketAddress(args[1], Integer.parseInt(args[2]));
+        clientLocalSocketAddress = new InetSocketAddress(args[1], 54321);
+        clientRemoteSocketAddress = new InetSocketAddress(nonProxyIp, 53);
         DatagramDnsQueryDecoder datagramDnsQueryDecoder = new DatagramDnsQueryDecoder();
         DatagramDnsResponseEncoder datagramDnsResponseEncoder = new DatagramDnsResponseEncoder();
 
@@ -56,57 +56,54 @@ public class Main {
                     }
                 });
         // 透传客户端，走udp
-        nonProxyBootstrap.group(eventLoopGroup)
+        clientNonProxyChannel = nonProxyBootstrap.group(eventLoopGroup)
                 .channel(NioDatagramChannel.class)
                 .handler(new ChannelInitializer<NioDatagramChannel>() {
                     @Override
                     protected void initChannel(NioDatagramChannel channel) throws Exception {
                         channel.pipeline().addLast(new DatagramDnsQueryEncoder());
                         channel.pipeline().addLast(new DatagramDnsResponseDecoder());
-                        channel.pipeline().addLast(dnsClientHandler);
-                    }
-                });
-
-
-        eventLoopGroup.scheduleAtFixedRate(() -> {
-            Set<String> expiredKeys = A.entrySet().stream()
-                    .filter(entry -> entry.getValue().lastAccess.isBefore(LocalDateTime.now().minusHours(1)))
-                    .map(Map.Entry::getKey)
-                    .collect(Collectors.toSet());
-            System.out.println("expiredKeys size=" + expiredKeys.size());
-            (new HashSet<>(expiredKeys)).forEach(key -> A.remove(key));
-
-
-            try {
-                List<String> keys = A.entrySet().stream()
-                        .filter(e -> e.getValue().records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire.minusSeconds(10))))
-                        .map(Map.Entry::getKey)
-                        .collect(Collectors.toList());
-                System.out.println("refresh keys size=" + keys.size());
-                keys.forEach(key -> queryProxy(queryId++, new DefaultDnsQuestion(key, DnsRecordType.A), null, null));
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
-        }, 0, 10, TimeUnit.SECONDS);
-
-        managerBootStrap.group(eventLoopGroup)
-                .channel(NioServerSocketChannel.class)
-                .childHandler(new ChannelInitializer<NioSocketChannel>() {
-                    @Override
-                    protected void initChannel(NioSocketChannel ch) throws Exception {
-                        ch.pipeline().addLast(new StringEncoder());
-                        ch.pipeline().addLast(new StringDecoder());
-                        ch.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+                        channel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
                             @Override
                             public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-                                ctx.writeAndFlush(executeCommand((String) msg) + "\n");
+                                if (!(msg instanceof DnsResponse dns)) {
+                                    return;
+                                }
+                                if (!socketMap.containsKey(dns.id())) {
+                                    System.out.println("[error] client socket not exists");
+                                    return;
+                                }
+                                int count = dns.count(DnsSection.ANSWER);
+                                if (count <= 0) {
+                                    return;
+                                }
+                                List<DnsRecord> records = new ArrayList<>();
+                                for (int i = 0; i < count; i++) records.add(dns.recordAt(DnsSection.ANSWER, i));
+
+                                List<Record> cacheRecords = records.stream().map(Record::new).toList();
+                                DnsResponse response = new DatagramDnsResponse(serverSocketAddress, socketMap.get(dns.id()), idMap.get(dns.id()));
+                                response.setRecord(DnsSection.QUESTION, dns.recordAt(DnsSection.QUESTION, 0));
+                                cacheRecords.stream()
+                                        .map(r -> new DefaultDnsRawRecord(
+                                                r.record.name(),
+                                                r.record.type(),
+                                                Duration.between(LocalDateTime.now(), r.expire).getSeconds(),
+                                                r.record.content().copy())
+                                        )
+                                        .forEach(r -> response.addRecord(DnsSection.ANSWER, r));
+                                serverChannel.writeAndFlush(response);
+                                dns.release();
+                                idMap.remove(dns.id());
+                                socketMap.remove(dns.id());
                             }
                         });
                     }
                 })
-                .bind("0.0.0.0", 5355);
+                .bind(clientLocalSocketAddress)
+                .sync()
+                .channel();
 
-        serverBootstrap.group(eventLoopGroup)
+        serverChannel = serverBootstrap.group(eventLoopGroup)
                 .channel(NioDatagramChannel.class)
                 .handler(new ChannelInitializer<NioDatagramChannel>() {
                     @Override
@@ -129,6 +126,7 @@ public class Main {
                                     }
 
                                     queryProxy(dnsQuery.id(), dnsQuery.recordAt(DnsSection.QUESTION), ctx.channel(), dnsQuery);
+                                    dnsQuery.release();
                                 } catch (Exception e) {
                                     System.out.println("channelRead: udp channel exception");
                                     e.printStackTrace();
@@ -137,8 +135,6 @@ public class Main {
                         });
                     }
 
-
-
                     @Override
                     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
                         System.out.println("exceptionCaught: udp channel exception");
@@ -146,8 +142,18 @@ public class Main {
                     }
                 })
                 .bind(args[1], Integer.parseInt(args[2]))
-                .sync();
-        Thread.sleep(3600 * 24 * 365 * 1000L);
+                .sync()
+                .channel();
+
+        BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(System.in));
+        String line;
+        while (true) {
+            line = bufferedReader.readLine();
+            if (line == null) {
+                continue;
+            }
+            System.out.println(executeCommand(line));
+        }
     }
 
     static final ChannelHandler dnsClientHandler = new DnsClientHandler();
@@ -156,11 +162,9 @@ public class Main {
     static class DnsClientHandler extends ChannelInboundHandlerAdapter {
         @Override
         public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
-            if (!(msg instanceof DnsResponse)) {
+            if (!(msg instanceof DnsResponse dns)) {
                 return;
             }
-            DnsResponse dns = (DnsResponse) msg;
-            String name = ctx.channel().attr(AttributeKey.<String>valueOf("name")).get();
 
             int count = dns.count(DnsSection.ANSWER);
 
@@ -170,16 +174,16 @@ public class Main {
             List<DnsRecord> records = new ArrayList<>();
             for (int i = 0; i < count; i++) records.add(dns.recordAt(DnsSection.ANSWER, i));
 
-            List<Record> cacheRecords = records.stream().map(Record::new).collect(Collectors.toList());
+            List<Record> cacheRecords = records.stream().map(Record::new).toList();
             Channel channel = ctx.channel().attr(AttributeKey.<Channel>valueOf("channel")).get();
             if (channel == null) {
                 return;
             }
             Integer id = ctx.channel().attr(AttributeKey.<Integer>valueOf("id")).get();
-            DnsResponse response = getResponse(
+            DnsResponse response = new DatagramDnsResponse(
                     ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("recipient")).get(),
                     ctx.channel().attr(AttributeKey.<InetSocketAddress>valueOf("sender")).get(),
-                    id, name
+                    id
             );
             response.setRecord(DnsSection.QUESTION, ctx.channel().attr(AttributeKey.<DefaultDnsQuestion>valueOf("question")).get());
             cacheRecords.stream()
@@ -217,12 +221,12 @@ public class Main {
     static String executeCommand(String command) {
         StringBuilder sb = new StringBuilder();
         switch (command) {
-            case "count\n":
-                return String.valueOf(A.size());
-            case "list\n":
-                A.keySet().forEach(key -> sb.append(key).append("\n"));
-                return sb.toString();
-            case "listproxy\n":
+//            case "count\n":
+//                return String.valueOf(A.size());
+//            case "list\n":
+//                A.keySet().forEach(key -> sb.append(key).append("\n"));
+//                return sb.toString();
+            case "listproxy":
                 proxyDomains.forEach(key -> sb.append(key).append("\n"));
                 return sb.toString();
             default:
@@ -230,12 +234,16 @@ public class Main {
                     proxyIp = command.split(" ")[1];
                     return proxyIp;
                 }
-                if (command.startsWith("remove")) {
-                    A.remove(command.substring(7));
+                if (command.startsWith("nonProxyIp")) {
+                    nonProxyIp = command.split(" ")[1];
+                    return nonProxyIp;
                 }
+//                if (command.startsWith("remove")) {
+//                    A.remove(command.substring(7));
+//                }
                 if (command.startsWith("addproxy")) {
                     String domain = command.split(" ")[1];
-                    proxyDomains.add(domain.substring(0, domain.length() - 1));
+                    proxyDomains.add(domain);
                 }
                 if (command.startsWith("delproxy")) {
                     String domain = command.split(" ")[1];
@@ -251,78 +259,40 @@ public class Main {
         ChannelFuture proxy;
         if (doProxy) {
             proxy = bootstrap.connect(proxyIp, 53);
+            proxy.addListener(new ChannelFutureListener() {
+                @Override
+                public void operationComplete(ChannelFuture channelFuture) throws Exception {
+                    if (!channelFuture.isSuccess()) {
+                        channelFuture.channel().close();
+                    }
+                    DefaultDnsQuery defaultDnsQuery = new DefaultDnsQuery(id);
+                    defaultDnsQuery.setOpCode(DnsOpCode.QUERY);
+                    defaultDnsQuery.setRecord(DnsSection.QUESTION, question);
+                    defaultDnsQuery.setRecursionDesired(true);
+                    Channel proxy = channelFuture.channel();
+                    if (channel != null) {
+                        proxy.attr(AttributeKey.valueOf("channel")).set(channel);
+                    }
+                    if (query != null) {
+                        proxy.attr(AttributeKey.valueOf("sender")).set(query.sender());
+                        proxy.attr(AttributeKey.valueOf("recipient")).set(query.recipient());
+                    }
+                    proxy.attr(AttributeKey.valueOf("question")).set(question);
+                    proxy.attr(AttributeKey.valueOf("name")).set(question.name());
+                    proxy.attr(AttributeKey.valueOf("id")).set(id);
+                    proxy.writeAndFlush(defaultDnsQuery);
+                }
+            });
         } else {
-            proxy = nonProxyBootstrap.connect(nonProxyIp, 53);
+            globalId = globalId + 1;
+            DefaultDnsQuery defaultDnsQuery = new DatagramDnsQuery(clientLocalSocketAddress, clientRemoteSocketAddress, globalId);
+            defaultDnsQuery.setOpCode(DnsOpCode.QUERY);
+            defaultDnsQuery.setRecord(DnsSection.QUESTION, question);
+            defaultDnsQuery.setRecursionDesired(true);
+            socketMap.put(globalId, query.sender());
+            idMap.put(globalId, id);
+            clientNonProxyChannel.writeAndFlush(defaultDnsQuery);
         }
-        proxy.addListener(new ChannelFutureListener() {
-            @Override
-            public void operationComplete(ChannelFuture channelFuture) throws Exception {
-                if (!channelFuture.isSuccess()) {
-                    channelFuture.channel().close();
-                }
-                DefaultDnsQuery defaultDnsQuery;
-                if (doProxy) {
-                    defaultDnsQuery = new DefaultDnsQuery(id);
-                } else {
-                    defaultDnsQuery = new DatagramDnsQuery((InetSocketAddress) channelFuture.channel().localAddress(), (InetSocketAddress) channelFuture.channel().remoteAddress(), query.id());
-                }
-                defaultDnsQuery.setOpCode(DnsOpCode.QUERY);
-                defaultDnsQuery.setRecord(DnsSection.QUESTION, question);
-                defaultDnsQuery.setRecursionDesired(true);
-                Channel proxy = channelFuture.channel();
-                if (channel != null) {
-                    proxy.attr(AttributeKey.valueOf("channel")).set(channel);
-                }
-                if (query != null) {
-                    proxy.attr(AttributeKey.valueOf("sender")).set(query.sender());
-                    proxy.attr(AttributeKey.valueOf("recipient")).set(query.recipient());
-                }
-                proxy.attr(AttributeKey.valueOf("question")).set(question);
-                proxy.attr(AttributeKey.valueOf("name")).set(question.name());
-                proxy.attr(AttributeKey.valueOf("id")).set(id);
-                proxy.writeAndFlush(defaultDnsQuery);
-            }
-        });
-    }
-
-    static DnsResponse getResponse(InetSocketAddress src, InetSocketAddress dst, int id, String name) {
-        if (!A.containsKey(name)) {
-            return new DatagramDnsResponse(src, dst, id);
-        }
-        Answer answer = A.get(name);
-        answer.lastAccess = LocalDateTime.now();
-        DefaultDnsResponse response = new DatagramDnsResponse(src, dst, id);
-        response.setRecord(DnsSection.QUESTION, answer.question);
-        answer.records.stream()
-                .map(r -> new DefaultDnsRawRecord(
-                        r.record.name(),
-                        r.record.type(),
-                        Duration.between(LocalDateTime.now(), r.expire).getSeconds(),
-                        r.record.content().copy())
-                )
-                .forEach(r -> response.addRecord(DnsSection.ANSWER, r));
-        return response;
-    }
-
-    static DnsResponse getResponse(InetSocketAddress src, InetSocketAddress dst, int id, Answer answer) {
-        answer.lastAccess = LocalDateTime.now();
-        DefaultDnsResponse response = new DatagramDnsResponse(src, dst, id);
-        response.setRecord(DnsSection.QUESTION, answer.question);
-        answer.records.stream()
-                .map(r -> new DefaultDnsRawRecord(
-                        r.record.name(),
-                        r.record.type(),
-                        Duration.between(LocalDateTime.now(), r.expire).getSeconds(),
-                        r.record.content().copy())
-                )
-                .forEach(r -> response.addRecord(DnsSection.ANSWER, r));
-        return response;
-    }
-
-    static class Answer {
-        List<Record> records = new ArrayList<>();
-        DefaultDnsQuestion question;
-        LocalDateTime lastAccess;
     }
 
     static class Record {
@@ -333,26 +303,5 @@ public class Main {
             this.record = (DefaultDnsRawRecord) ((DefaultDnsRawRecord) record).duplicate();
             this.expire = LocalDateTime.now().plusSeconds(record.timeToLive());
         }
-
-        String name() {
-            return record.name();
-        }
-    }
-
-    static void put(String key, Answer answer) {
-        if (enableCache) {
-            A.put(key, answer);
-        }
-    }
-
-    static Answer get(String key) {
-        if (!enableCache) return null;
-        Answer answer = A.get(key);
-        List<Record> records = answer.records;
-        if (records.stream().anyMatch(r -> LocalDateTime.now().isAfter(r.expire))) {
-            A.remove(key);
-            return null;
-        }
-        return answer;
     }
 }
