@@ -114,7 +114,7 @@ public class Main {
                             @Override
                             public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
                                 try {
-                                    if (!(msg instanceof DatagramDnsQuery dnsQuery)) {
+                                     if (!(msg instanceof DatagramDnsQuery dnsQuery)) {
                                         return;
                                     }
 
@@ -285,6 +285,9 @@ public class Main {
             });
         } else {
             globalId = globalId + 1;
+            if (globalId > 50000) {
+                globalId = 0;
+            }
             DefaultDnsQuery defaultDnsQuery = new DatagramDnsQuery(clientLocalSocketAddress, clientRemoteSocketAddress, globalId);
             defaultDnsQuery.setOpCode(DnsOpCode.QUERY);
             defaultDnsQuery.setRecord(DnsSection.QUESTION, question);
