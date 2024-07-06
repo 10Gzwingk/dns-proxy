@@ -36,6 +36,7 @@ public class Main {
     private static InetSocketAddress clientLocalSocketAddress;
     private static InetSocketAddress clientRemoteSocketAddress;
     private static int globalId = 0;
+    private static Set<String> processedDomains = new HashSet<>();
 
     public static void main(String[] args) throws InterruptedException, IOException {
         serverSocketAddress = new InetSocketAddress(args[1], Integer.parseInt(args[2]));
@@ -249,11 +250,16 @@ public class Main {
                     String domain = command.split(" ")[1];
                     proxyDomains.remove(domain);
                 }
+                if (command.startsWith("processed")) {
+                    processedDomains.forEach(key -> sb.append(key).append("\n"));
+                    return sb.toString();
+                }
                 return "ok";
         }
     }
 
     static void queryProxy(int id, DnsQuestion question, Channel channel, DatagramDnsQuery query) {
+        processedDomains.add(question.name());
         boolean doProxy = proxyDomains.stream()
                 .anyMatch(domain -> question.name().contains(domain));
         ChannelFuture proxy;
